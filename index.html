@@ -1,0 +1,302 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Robot Sensor Fusion</title>
+<style>
+:root{font:17px system-ui,sans-serif;color:#172538;background:#edf2f5}
+body{max-width:1080px;margin:32px auto;padding:0 18px}
+h1,h2{line-height:1.14} h1{font-size:clamp(2rem,6vw,3.4rem);margin:.4em 0}
+a{color:#075d80} p{line-height:1.5}
+.controls,.lesson,.plot{background:white;border:1px solid #c7d4dd;border-radius:12px;padding:18px}
+.controls{display:flex;align-items:end;gap:14px;flex-wrap:wrap}
+label{display:grid;gap:5px} label.check{display:flex;align-items:center}
+button,select,input{font:inherit} select,button{padding:8px;border:1px solid #a4b7c6;border-radius:6px}
+button{background:#e8f2f8;color:#173752;cursor:pointer} button.primary{background:#174f73;color:white}
+button:disabled{opacity:.48;cursor:default}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin:16px 0}
+pre{white-space:pre-wrap;line-height:1.45;background:#eff5f8;padding:12px;border-radius:8px;min-height:100px}
+canvas{display:block;width:100%;background:#f7fafb;border-radius:8px;margin-top:10px}
+small{display:block;line-height:1.5}
+.key{font-size:.9rem} .prior{color:#205a91}.sensor{color:#934004}.posterior{color:#087154}.truth{color:#505660}
+@media(max-width:780px){.grid{grid-template-columns:1fr}}
+</style>
+<main>
+<a href="worked-examples.md">Worked examples and classroom activity</a>
+<h1>Robot Sensor Fusion</h1>
+<p>Predict the next result, then reveal one calculation at a time.</p>
+<section class="controls" aria-label="Simulator settings">
+<label>Lesson
+<select id="mode">
+<option value="scalar">Scalar KF · position fix</option>
+<option value="velocity">Linear KF · position and velocity</option>
+<option value="range">EKF · beacon range</option>
+<option value="track">Repeated KF · intermittent fixes</option>
+</select></label>
+<label>Measurement variance R <output id="noise-value" for="noise"></output>
+<input id="noise" type="range" min="0.05" max="4" step="0.05" value="0.25"></label>
+<label class="check"><input id="sensor" type="checkbox" checked> Use sensor</label>
+</section>
+<div class="grid">
+<section class="lesson" aria-labelledby="stage">
+<small id="progress"></small>
+<h2 id="stage"></h2>
+<p id="prompt"></p>
+<pre id="numbers" aria-live="polite"></pre>
+<button id="back" type="button">Back</button>
+<button id="next" type="button" class="primary">Next step</button>
+<button id="reset" type="button">Reset</button>
+</section>
+<section class="plot" aria-labelledby="plot-title">
+<h2 id="plot-title">Position view</h2>
+<div class="key"><span class="prior">● Predicted</span> · <span class="sensor">◆ Measurement</span> · <span class="posterior">● Corrected</span> · <span class="truth">— Truth (tracking)</span></div>
+<canvas id="view" width="620" height="360" role="img" aria-label="Position view. Numerical results are shown in the step panel."></canvas>
+<p id="caption"></p>
+</section>
+</div>
+</main>
+<script>
+"use strict";
+
+const byId = (id) => document.getElementById(id);
+const mode = byId("mode");
+const noise = byId("noise");
+const sensor = byId("sensor");
+const steps = ["Model", "Prediction", "Innovation", "Gain", "Correction"];
+const format = (value) => Number(value.toFixed(4)).toString();
+const vector = (values) => "[" + values.map(format).join(", ") + "]";
+const matrix = (rows) => rows.map(vector).join(" ");
+const dot = (left, right) => left.reduce((sum, value, index) => sum + value * right[index], 0);
+
+function correct(prior, covariance, H, expected, measured, R) {
+    const projected = covariance.map((row) => dot(row, H));
+    const S = dot(H, projected) + R;
+    const gain = projected.map((value) => value / S);
+    const innovation = measured - expected;
+    return {
+        S,
+        gain,
+        innovation,
+        state: prior.map((value, i) => value + gain[i] * innovation),
+        covariance: covariance.map((row, i) =>
+            row.map((value, j) => value - gain[i] * projected[j])
+        ),
+    };
+}
+
+const examples = {
+    scalar: {
+        name: "Wheel odometry and a position fix",
+        model: "The previous position is 9 m. Odometry adds 1 m. P = 0.8 m² and Q = 0.2 m².",
+        prediction: "x⁻ = 9 + 1,  P⁻ = 0.8 + 0.2",
+        state: [10], covariance: [[1]], H: [1], measured: 10.6, expected: 10, R: 0.25,
+    },
+    velocity: {
+        name: "A position fix can correct velocity",
+        model: "State = [position, velocity]. Start at [0 m, 1 m/s] with P = I. Predict one second ahead with Q = 0.",
+        prediction: "F = [[1, 1], [0, 1]],  x⁻ = Fx,  P⁻ = FPFᵀ",
+        state: [1, 1], covariance: [[2, 1], [1, 1]], H: [1, 0], measured: 1.6, expected: 1, R: 1,
+    },
+    range: {
+        name: "A range fix constrains direction",
+        model: "A beacon at the origin reports 6 m. Use h(x, y) = √(x² + y²). Dead reckoning supplies the prediction.",
+        prediction: "Given x⁻ = [3, 4] m and P⁻ = I m². Evaluate h and its Jacobian there.",
+        state: [3, 4], covariance: [[1, 0], [0, 1]], H: [3 / 5, 4 / 5],
+        measured: 6, expected: Math.hypot(3, 4), R: 0.25,
+    },
+};
+
+const fixes = [1.1, 2.0, null, null, null, 6.2, 6.9, 8.1];
+
+function replay(R, useSensor) {
+    let position = 0;
+    let variance = 0.8;
+    return fixes.map((measured, index) => {
+        const expected = position + 1.18;
+        const covariance = [[variance + 0.2]];
+        const state = [expected];
+        const H = [1];
+        const update = useSensor && measured !== null
+            ? correct(state, covariance, H, expected, measured, R)
+            : {state, covariance};
+        position = update.state[0];
+        variance = update.covariance[0][0];
+        return {
+            name: "Track through missing position fixes",
+            model: "Truth advances 1 m/tick. Biased odometry advances 1.18 m/tick. Fixes are missing at ticks 3–5.",
+            prediction: "Advance the last estimate by 1.18 m and add Q = 0.2 m².",
+            state, covariance, H, expected, measured, update, time: index + 1,
+        };
+    });
+}
+
+const canvas = byId("view");
+const ctx = canvas.getContext("2d");
+const colors = {prior: "#205a91", sensor: "#934004", posterior: "#087154", truth: "#505660"};
+
+function line(x1, y1, x2, y2, color, width = 2) {
+    ctx.strokeStyle = color;
+    ctx.lineWidth = width;
+    ctx.beginPath();
+    ctx.moveTo(x1, y1);
+    ctx.lineTo(x2, y2);
+    ctx.stroke();
+}
+
+function mark(x, y, color, diamond = false) {
+    ctx.fillStyle = color;
+    ctx.beginPath();
+    if (diamond) {
+        ctx.moveTo(x, y - 8);
+        ctx.lineTo(x + 8, y);
+        ctx.lineTo(x, y + 8);
+        ctx.lineTo(x - 8, y);
+    } else {
+        ctx.arc(x, y, 7, 0, 2 * Math.PI);
+    }
+    ctx.fill();
+}
+
+function circle(x, y, radius, color) {
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(x, y, radius, 0, 2 * Math.PI);
+    ctx.stroke();
+}
+
+let cursor = 0;
+
+function draw(lesson, update, stage, history, active) {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.fillStyle = "#394b5b";
+    ctx.font = "16px system-ui";
+    if (mode.value === "range") {
+        const origin = [310, 180];
+        const scale = 25;
+        line(44, 180, 575, 180, "#bac7ce");
+        line(310, 22, 310, 338, "#bac7ce");
+        ctx.fillText("x (m)", 555, 204);
+        ctx.fillText("y (m)", 322, 30);
+        mark(...origin, colors.truth);
+        ctx.fillText("Beacon", 320, 204);
+        if (stage >= 2 && active) circle(...origin, lesson.measured * scale, colors.sensor);
+        const predicted = [310 + 3 * scale, 180 - 4 * scale];
+        if (stage >= 1) mark(...predicted, colors.prior);
+        if (stage === 4 && active) {
+            const corrected = [310 + update.state[0] * scale, 180 - update.state[1] * scale];
+            line(...predicted, ...corrected, colors.posterior);
+            mark(...corrected, colors.posterior);
+        }
+        return;
+    }
+    if (mode.value === "track") {
+        const x = (time) => 55 + time * 65;
+        const y = (position) => 302 - position * 28;
+        line(55, 22, 55, 302, "#bac7ce");
+        line(55, 302, 575, 302, "#bac7ce");
+        ctx.fillText("Position (m)", 62, 30);
+        ctx.fillText("Tick", 520, 350);
+        for (let tick = 0; tick <= fixes.length; tick++) {
+            ctx.fillText(String(tick), x(tick) - 4, 327);
+        }
+        line(x(0), y(0), x(lesson.time), y(lesson.time), colors.truth);
+        let last = [x(0), y(0)];
+        history.slice(0, lesson.time).forEach((entry) => {
+            const past = entry.time < lesson.time;
+            const t = x(entry.time);
+            if (past || stage >= 1) mark(t, y(entry.expected), colors.prior);
+            if ((past || stage >= 2) && sensor.checked && entry.measured !== null) {
+                mark(t, y(entry.measured), colors.sensor, true);
+            }
+            if (past || stage === 4) {
+                const point = [t, y(entry.update.state[0])];
+                line(...last, ...point, colors.posterior);
+                mark(...point, colors.posterior);
+                last = point;
+            }
+        });
+        return;
+    }
+    const mapX = (position) => 310 + (position - lesson.expected) * 190;
+    line(45, 252, 575, 252, "#bac7ce");
+    for (const offset of [-1, -0.5, 0, 0.5, 1]) {
+        const position = lesson.expected + offset;
+        const x = mapX(position);
+        line(x, 245, x, 261, "#bac7ce");
+        ctx.fillText(format(position), x - 12, 288);
+    }
+    ctx.fillText("Position (m)", 465, 327);
+    if (stage >= 1) mark(mapX(lesson.expected), 235, colors.prior);
+    if (stage >= 2 && active) mark(mapX(lesson.measured), 210, colors.sensor, true);
+    if (stage === 4 && active) mark(mapX(update.state[0]), 175, colors.posterior);
+}
+
+function render() {
+    const R = Number(noise.value);
+    const tracking = mode.value === "track";
+    const history = tracking ? replay(R, sensor.checked) : [];
+    const tick = Math.floor(cursor / steps.length);
+    const stage = cursor % steps.length;
+    const lesson = tracking ? history[tick] : examples[mode.value];
+    const active = sensor.checked && lesson.measured !== null;
+    const update = active
+        ? correct(lesson.state, lesson.covariance, lesson.H, lesson.expected, lesson.measured, R)
+        : {state: lesson.state, covariance: lesson.covariance};
+
+    const predictions = [
+        "Before continuing, write down the predicted state.",
+        "Predict the sensor reading from this state. Which way should the correction move?",
+        "Will a smaller sensor variance increase or decrease the correction?",
+        "Multiply the gain by the innovation. Which components will change?",
+        "Try a different R or switch the sensor off, then explain what changes.",
+    ];
+    const rows = [lesson.model, lesson.prediction + "\nx⁻ = " + vector(lesson.state)
+        + "\nP⁻ = " + matrix(lesson.covariance)];
+
+    if (active) {
+        rows.push("z = " + format(lesson.measured) + " m,  ẑ = " + format(lesson.expected)
+            + " m\nInnovation y = z − ẑ = " + format(update.innovation) + " m");
+        rows.push("H = " + vector(lesson.H) + "\nS = HP⁻Hᵀ + R = " + format(update.S)
+            + " m²\nK = P⁻Hᵀ / S = " + vector(update.gain));
+        rows.push("x⁺ = x⁻ + Ky = " + vector(update.state)
+            + "\nP⁺ = P⁻ − K(HP⁻) = " + matrix(update.covariance));
+    } else {
+        rows.push("No usable position measurement at this step.", "Skip the gain calculation.",
+            "Keep x⁺ = " + vector(update.state) + "\nKeep P⁺ = " + matrix(update.covariance));
+        predictions[2] = "What information is available without a sensor fix?";
+        predictions[3] = "Does prediction-only make uncertainty smaller?";
+    }
+
+    byId("noise-value").textContent = format(R) + " m²";
+    byId("stage").textContent = steps[stage];
+    byId("progress").textContent = lesson.name + " · " +
+        (tracking ? "Tick " + lesson.time + " / " + fixes.length + " · " : "")
+        + "Step " + (stage + 1) + " / " + steps.length;
+    byId("prompt").textContent = predictions[stage];
+    byId("numbers").textContent = rows[stage];
+    byId("caption").textContent = mode.value === "range"
+        ? "The orange circle shows all positions consistent with the measured range."
+        : tracking ? "The gray line is simulated truth. During a dropout, watch the estimate drift and P grow."
+        : "Markers are vertically offset so overlapping values are easier to distinguish.";
+    byId("back").disabled = cursor === 0;
+    byId("next").disabled = cursor === steps.length * (tracking ? fixes.length : 1) - 1;
+    draw(lesson, update, stage, history, active);
+}
+
+function reset() {
+    cursor = 0;
+    noise.value = examples[mode.value]?.R ?? 0.25;
+    sensor.checked = true;
+    render();
+}
+
+mode.addEventListener("change", reset);
+noise.addEventListener("input", render);
+sensor.addEventListener("change", render);
+byId("back").addEventListener("click", () => { cursor--; render(); });
+byId("next").addEventListener("click", () => { cursor++; render(); });
+byId("reset").addEventListener("click", reset);
+reset();
+</script>
+</html>
